@@ -57,7 +57,7 @@ double BasePhysics::minTime() const { return min_time_; }
 
 int BasePhysics::minCycle() const { return min_cycle_; }
 
-std::vector<double> BasePhysics::timesteps() const { return timesteps_; }
+const std::vector<double>& BasePhysics::timesteps() const { return timesteps_; }
 
 void BasePhysics::initializeBasePhysicsStates(int cycle, double time)
 {
@@ -145,8 +145,6 @@ void BasePhysics::CreateParaviewDataCollection() const
   max_order_in_fields = std::max(max_order_in_fields, shape_displacement_.space().GetOrder(0));
 
   shape_sensitivity_grid_function_ = std::make_unique<mfem::ParGridFunction>(&shape_displacement_sensitivity_->space());
-  shape_displacement_sensitivity_->space().GetRestrictionMatrix()->MultTranspose(*shape_displacement_sensitivity_,
-                                                                                 *shape_sensitivity_grid_function_);
   max_order_in_fields = std::max(max_order_in_fields, shape_displacement_sensitivity_->space().GetOrder(0));
   paraview_dc_->RegisterField(shape_displacement_sensitivity_->name(), shape_sensitivity_grid_function_.get());
 
@@ -163,16 +161,16 @@ void BasePhysics::UpdateParaviewDataCollection(const std::string& paraview_outpu
     state->gridFunction();  // update grid function values
   }
   for (const FiniteElementDual* dual : duals_) {
-    // These are really const calls, but MFEM doesn't label them as such
     serac::FiniteElementDual* non_const_dual = const_cast<serac::FiniteElementDual*>(dual);
-    non_const_dual->space().GetRestrictionMatrix()->MultTranspose(*dual, *paraview_dual_grid_functions_[dual->name()]);
+    non_const_dual->linearForm().ParallelAssemble(paraview_dual_grid_functions_[dual->name()]->GetTrueVector());
+    paraview_dual_grid_functions_[dual->name()]->SetFromTrueVector();
   }
   for (auto& parameter : parameters_) {
     parameter.state->gridFunction();
   }
   shape_displacement_.gridFunction();
-  shape_displacement_sensitivity_->space().GetRestrictionMatrix()->MultTranspose(*shape_displacement_sensitivity_,
-                                                                                 *shape_sensitivity_grid_function_);
+  shape_displacement_sensitivity_->linearForm().ParallelAssemble(shape_sensitivity_grid_function_->GetTrueVector());
+  shape_sensitivity_grid_function_->SetFromTrueVector();
 
   // Set the current time, cycle, and requested paraview directory
   paraview_dc_->SetCycle(cycle_);
@@ -358,21 +356,34 @@ FiniteElementState BasePhysics::loadCheckpointedState(const std::string& state_n
   return checkpoint_states_.at(state_name)[static_cast<size_t>(cycle)];
 }
 
-std::unordered_map<std::string, FiniteElementState> BasePhysics::getCheckpointedStates(int /*cycle*/) const
+std::unordered_map<std::string, FiniteElementState> BasePhysics::getCheckpointedStates(int cycle_to_load) const
 {
-  SLIC_ERROR_ROOT(axom::fmt::format(
-      "loadCheckpointedState and getCheckpointedStates not implemented for physics module {}.", name_));
-  std::unordered_map<std::string, FiniteElementState> empty_container;
-  return empty_container;
+  std::unordered_map<std::string, FiniteElementState> previous_states_map;
+  std::vector<FiniteElementState*>                    previous_states_ptrs;
+
+  if (checkpoint_to_disk_) {
+    for (const auto& state_name : stateNames()) {
+      previous_states_map.emplace(state_name, state(state_name));
+      previous_states_ptrs.emplace_back(const_cast<FiniteElementState*>(&state(state_name)));
+    }
+    StateManager::loadCheckpointedStates(cycle_to_load, previous_states_ptrs);
+    return previous_states_map;
+  } else {
+    for (const auto& state_name : stateNames()) {
+      previous_states_map.emplace(state_name, checkpoint_states_.at(state_name)[static_cast<size_t>(cycle_to_load)]);
+    }
+  }
+
+  return previous_states_map;
 }
 
 double BasePhysics::getCheckpointedTimestep(int cycle) const
 {
   SLIC_ERROR_ROOT_IF(cycle < 0, axom::fmt::format("Negative cycle number requested for physics module {}.", name_));
-  SLIC_ERROR_ROOT_IF(cycle > max_cycle_,
+  SLIC_ERROR_ROOT_IF(cycle > static_cast<int>(timesteps_.size()),
                      axom::fmt::format("Timestep for cycle {} requested, but physics module has only reached cycle {}.",
-                                       cycle, max_cycle_));
-  return timesteps_[static_cast<size_t>(cycle)];
+                                       cycle, timesteps_.size()));
+  return cycle < static_cast<int>(timesteps_.size()) ? timesteps_[static_cast<size_t>(cycle)] : 0.0;
 }
 
 namespace detail {

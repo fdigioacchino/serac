@@ -12,15 +12,15 @@ set(language_tests
     copy_elision.cpp
     mfem_array_std_algo.cpp)
 
-set(language_dependencies
+set(language_depends
     gtest
     mfem
     blt::mpi)
 
-blt_list_append(TO language_dependencies ELEMENTS blt::openmp IF ENABLE_OPENMP)
+blt_list_append(TO language_depends ELEMENTS blt::openmp IF ENABLE_OPENMP)
 
-serac_add_tests( SOURCES ${language_tests}
-                 DEPENDS_ON ${language_dependencies})
+serac_add_tests( SOURCES    ${language_tests}
+                 DEPENDS_ON ${language_depends})
 
 if(ENABLE_CUDA)
     blt_add_library( NAME       cuda_smoketest_kernel
@@ -39,13 +39,13 @@ serac_add_tests( SOURCES       axom_smoketest.cpp
                  DEPENDS_ON    axom::inlet)
 
 if(PETSC_FOUND)
-    serac_add_tests(SOURCES       petsc_smoketest.cpp
-                    DEPENDS_ON    PkgConfig::PETSC gtest axom::slic
+    serac_add_tests(SOURCES       mfem_petsc_smoketest.cpp
+                    DEPENDS_ON    gtest serac_infrastructure
                     NUM_MPI_TASKS 4)
 
     if(SLEPC_FOUND)
-        serac_add_tests(SOURCES       slepc_smoketest.cpp
-                        DEPENDS_ON    PkgConfig::SLEPC gtest axom::slic
+        serac_add_tests(SOURCES       mfem_slepc_smoketest.cpp
+                        DEPENDS_ON    gtest serac_infrastructure
                         NUM_MPI_TASKS 4)
     endif()
 endif()

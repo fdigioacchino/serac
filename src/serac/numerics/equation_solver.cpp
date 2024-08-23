@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: (BSD-3-Clause)
 
 #include "serac/numerics/equation_solver.hpp"
+
 #include <iomanip>
 #include <sstream>
 #include <ios>
@@ -13,6 +14,7 @@
 #include "serac/infrastructure/logger.hpp"
 #include "serac/infrastructure/terminator.hpp"
 #include "serac/serac_config.hpp"
+#include "serac/infrastructure/profiling.hpp"
 
 namespace serac {
 
@@ -37,8 +39,9 @@ public:
 #endif
 
   /// Evaluate the residual, put in rOut and return its norm.
-  double evaluate_norm(const mfem::Vector& x, mfem::Vector& rOut) const
+  double evaluateNorm(const mfem::Vector& x, mfem::Vector& rOut) const
   {
+    SERAC_MARK_FUNCTION;
     double normEval = std::numeric_limits<double>::max();
     try {
       oper->Mult(x, rOut);
@@ -47,6 +50,31 @@ public:
       normEval = std::numeric_limits<double>::max();
     }
     return normEval;
+  }
+
+  /// assemble the jacobian
+  void assembleJacobian(const mfem::Vector& x) const
+  {
+    SERAC_MARK_FUNCTION;
+    grad = &oper->GetGradient(x);
+    if (nonlinear_options.force_monolithic) {
+      auto* grad_blocked = dynamic_cast<mfem::BlockOperator*>(grad);
+      if (grad_blocked) grad = buildMonolithicMatrix(*grad_blocked).release();
+    }
+  }
+
+  /// set the preconditioner for the linear solver
+  void setPreconditioner() const
+  {
+    SERAC_MARK_FUNCTION;
+    prec->SetOperator(*grad);
+  }
+
+  /// solve the linear system
+  void solveLinearSystem(const mfem::Vector& r_, mfem::Vector& c_) const
+  {
+    SERAC_MARK_FUNCTION;
+    prec->Mult(r_, c_);  // c = [DF(x_i)]^{-1} [F(x_i)-b]
   }
 
   /// @overload
@@ -58,9 +86,8 @@ public:
     using real_t = mfem::real_t;
 
     real_t norm, norm_goal;
-    oper->Mult(x, r);
+    norm = initial_norm = evaluateNorm(x, r);
 
-    norm = initial_norm = Norm(r);
     if (print_options.first_and_last && !print_options.iterations) {
       mfem::out << "Newton iteration " << std::setw(3) << 0 << " : ||r|| = " << std::setw(13) << norm << "...\n";
     }
@@ -74,7 +101,7 @@ public:
       if (print_options.iterations) {
         mfem::out << "Newton iteration " << std::setw(3) << it << " : ||r|| = " << std::setw(13) << norm;
         if (it > 0) {
-          mfem::out << ", ||r||/||r_0|| = " << std::setw(13) << norm / initial_norm;
+          mfem::out << ", ||r||/||r_0|| = " << std::setw(13) << (initial_norm != 0.0 ? norm / initial_norm : norm);
         }
         mfem::out << '\n';
       }
@@ -89,10 +116,9 @@ public:
 
       real_t norm_nm1 = norm;
 
-      grad = &oper->GetGradient(x);
-      prec->SetOperator(*grad);
-
-      prec->Mult(r, c);  // c = [DF(x_i)]^{-1} [F(x_i)-b]
+      assembleJacobian(x);
+      setPreconditioner();
+      solveLinearSystem(r, c);
 
       // there must be a better way to do this?
       x0.SetSize(x.Size());
@@ -101,7 +127,7 @@ public:
 
       real_t stepScale = 1.0;
       add(x0, -stepScale, c, x);
-      norm = evaluate_norm(x, r);
+      norm = evaluateNorm(x, r);
 
       const int               max_ls_iters = nonlinear_options.max_line_search_iterations;
       static constexpr real_t reduction    = 0.5;
@@ -119,20 +145,20 @@ public:
       for (; !is_improved(norm, stepScale) && ls_iter < max_ls_iters; ++ls_iter, ++ls_iter_sum) {
         stepScale *= reduction;
         add(x0, -stepScale, c, x);
-        norm = evaluate_norm(x, r);
+        norm = evaluateNorm(x, r);
       }
 
       // try the opposite direction and linesearch back from there
       if (max_ls_iters > 0 && ls_iter == max_ls_iters && !is_improved(norm, stepScale)) {
         stepScale = 1.0;
         add(x0, stepScale, c, x);
-        norm = evaluate_norm(x, r);
+        norm = evaluateNorm(x, r);
 
         ls_iter = 0;
         for (; !is_improved(norm, stepScale) && ls_iter < max_ls_iters; ++ls_iter, ++ls_iter_sum) {
           stepScale *= reduction;
           add(x0, stepScale, c, x);
-          norm = evaluate_norm(x, r);
+          norm = evaluateNorm(x, r);
         }
 
         // ok, the opposite direction was also terrible, lets go back, cut in half 1 last time and accept it hoping for
@@ -141,7 +167,7 @@ public:
           ++ls_iter_sum;
           stepScale *= reduction;
           add(x0, -stepScale, c, x);
-          norm = evaluate_norm(x, r);
+          norm = evaluateNorm(x, r);
         }
       }
 
@@ -301,6 +327,7 @@ public:
   /// take a dogleg step in direction s, solution norm must be within trSize
   void dogleg_step(const mfem::Vector& cp, const mfem::Vector& newtonP, double trSize, mfem::Vector& s) const
   {
+    SERAC_MARK_FUNCTION;
     // MRT, could optimize some of these eventually, compute on the outside and save
     double cc = Dot(cp, cp);
     double nn = Dot(newtonP, newtonP);
@@ -329,6 +356,7 @@ public:
                                        PrecondFunc precond, const TrustRegionSettings& settings, double& trSize,
                                        TrustRegionResults& results) const
   {
+    SERAC_MARK_FUNCTION;
     // minimize r@z + 0.5*z@J@z
     results.interiorStatus    = TrustRegionResults::Status::Interior;
     results.cgIterationsCount = 0;
@@ -359,7 +387,7 @@ public:
     for (cgIter = 1; cgIter <= settings.maxCgIterations; ++cgIter) {
       hess_vec_func(d, Hd);
       const double curvature = Dot(d, Hd);
-      const double alphaCg   = rPr / curvature;
+      const double alphaCg   = curvature != 0.0 ? rPr / curvature : 0.0;
 
       auto& zPred = Hd;  // re-use Hd, this is where bugs come from
       add(z, alphaCg, d, zPred);
@@ -399,6 +427,39 @@ public:
     }
   }
 
+  /// assemble the jacobian
+  void assemble_jacobian(const mfem::Vector& x) const
+  {
+    SERAC_MARK_FUNCTION;
+    grad = &oper->GetGradient(x);
+    if (nonlinear_options.force_monolithic) {
+      auto* grad_blocked = dynamic_cast<mfem::BlockOperator*>(grad);
+      if (grad_blocked) grad = buildMonolithicMatrix(*grad_blocked).release();
+    }
+  }
+
+  /// evaluate the nonlinear residual
+  mfem::real_t computeResidual(const mfem::Vector& x_, mfem::Vector& r_) const
+  {
+    SERAC_MARK_FUNCTION;
+    oper->Mult(x_, r_);
+    return Norm(r_);
+  }
+
+  /// apply the action of the assembled Jacobian matrix to a vector
+  void hess_vec(const mfem::Vector& x_, mfem::Vector& v_) const
+  {
+    SERAC_MARK_FUNCTION;
+    grad->Mult(x_, v_);
+  }
+
+  /// apply trust region specific preconditioner
+  void precond(const mfem::Vector& x_, mfem::Vector& v_) const
+  {
+    SERAC_MARK_FUNCTION;
+    trPrecond.Mult(x_, v_);
+  };
+
   /// @overload
   void Mult(const mfem::Vector&, mfem::Vector& X) const
   {
@@ -408,9 +469,7 @@ public:
     using real_t = mfem::real_t;
 
     real_t norm, norm_goal;
-    oper->Mult(X, r);
-
-    norm = initial_norm = Norm(r);
+    norm = initial_norm = computeResidual(X, r);
     norm_goal           = std::max(rel_tol * initial_norm, abs_tol);
     if (print_options.first_and_last && !print_options.iterations) {
       mfem::out << "Newton iteration " << std::setw(3) << 0 << " : ||r|| = " << std::setw(13) << norm << "...\n";
@@ -429,8 +488,8 @@ public:
     TrustRegionResults  trResults(X.Size());
     TrustRegionSettings settings;
     settings.maxCgIterations = static_cast<size_t>(linear_options.max_iterations);
-    settings.cgTol           = 0.2 * norm_goal;
-    double trSize            = 10.0;
+    settings.cgTol           = 0.5 * norm_goal;
+    double trSize            = 0.1 * std::sqrt(X.Size());
     size_t cumulativeCgIters = 0;
 
     int it = 0;
@@ -439,7 +498,9 @@ public:
       if (print_options.iterations) {
         mfem::out << "Newton iteration " << std::setw(3) << it << " : ||r|| = " << std::setw(13) << norm;
         if (it > 0) {
-          mfem::out << ", ||r||/||r_0|| = " << std::setw(13) << norm / initial_norm;
+          mfem::out << ", ||r||/||r_0|| = " << std::setw(13) << (initial_norm != 0.0 ? norm / initial_norm : norm);
+        } else {
+          mfem::out << ", norm goal = " << std::setw(13) << norm_goal << "\n";
         }
         mfem::out << '\n';
       }
@@ -452,10 +513,11 @@ public:
         break;
       }
 
-      auto K = &oper->GetGradient(X);
+      assemble_jacobian(X);
+
       if (it == 0 || (trResults.cgIterationsCount >= settings.maxCgIterations ||
                       cumulativeCgIters >= settings.maxCumulativeIteration)) {
-        trPrecond.SetOperator(*K);
+        trPrecond.SetOperator(*grad);
         cumulativeCgIters = 0;
         if (print_options.iterations) {
           // currently it will always be updated
@@ -463,8 +525,8 @@ public:
         }
       }
 
-      auto hess_vec_func = [=](const mfem::Vector& x_, mfem::Vector& v_) { K->Mult(x_, v_); };
-      auto precond_func  = [=](const mfem::Vector& x_, mfem::Vector& v_) { trPrecond.Mult(x_, v_); };
+      auto hess_vec_func = [&](const mfem::Vector& x_, mfem::Vector& v_) { hess_vec(x_, v_); };
+      auto precond_func  = [&](const mfem::Vector& x_, mfem::Vector& v_) { precond(x_, v_); };
 
       double cauchyPointNormSquared = trSize * trSize;
       trResults.reset();
@@ -494,7 +556,7 @@ public:
         trResults.cgIterationsCount = 1;
         trResults.interiorStatus    = TrustRegionResults::Status::OnBoundary;
       } else {
-        settings.cgTol = std::max(0.2 * norm_goal, 1e-3 * norm);
+        settings.cgTol = std::max(0.5 * norm_goal, 5e-5 * norm);
         solve_trust_region_minimization(r, scratch, hess_vec_func, precond_func, settings, trSize, trResults);
       }
       cumulativeCgIters += trResults.cgIterationsCount;
@@ -517,9 +579,8 @@ public:
         double realObjective = std::numeric_limits<double>::max();
         double normPred      = std::numeric_limits<double>::max();
         try {
-          oper->Mult(xPred, rPred);
+          normPred      = computeResidual(xPred, rPred);
           realObjective = 0.5 * (Dot(r, d) + Dot(rPred, d));
-          normPred      = Norm(rPred);
         } catch (const std::exception&) {
           realObjective = std::numeric_limits<double>::max();
           normPred      = std::numeric_limits<double>::max();
@@ -634,14 +695,6 @@ void SuperLUSolver::Mult(const mfem::Vector& input, mfem::Vector& output) const
   superlu_solver_.Mult(input, output);
 }
 
-/**
- * @brief Function for building a monolithic parallel Hypre matrix from a block system of smaller Hypre matrices
- *
- * @param block_operator The block system of HypreParMatrices
- * @return The assembled monolithic HypreParMatrix
- *
- * @pre @a block_operator must have assembled HypreParMatrices for its sub-blocks
- */
 std::unique_ptr<mfem::HypreParMatrix> buildMonolithicMatrix(const mfem::BlockOperator& block_operator)
 {
   int row_blocks = block_operator.NumRowBlocks();
@@ -745,6 +798,16 @@ std::unique_ptr<mfem::NewtonSolver> buildNonlinearSolver(const NonlinearSolverOp
     nonlinear_solver = std::make_unique<NewtonSolver>(comm, nonlinear_opts);
   } else if (nonlinear_opts.nonlin_solver == NonlinearSolver::TrustRegion) {
     nonlinear_solver = std::make_unique<TrustRegion>(comm, nonlinear_opts, linear_opts, prec);
+#ifdef SERAC_USE_PETSC
+  } else if (nonlinear_opts.nonlin_solver == NonlinearSolver::PetscNewton) {
+    nonlinear_solver = std::make_unique<mfem_ext::PetscNewtonSolver>(comm, nonlinear_opts);
+  } else if (nonlinear_opts.nonlin_solver == NonlinearSolver::PetscNewtonBacktracking) {
+    nonlinear_solver = std::make_unique<mfem_ext::PetscNewtonSolver>(comm, nonlinear_opts);
+  } else if (nonlinear_opts.nonlin_solver == NonlinearSolver::PetscNewtonCriticalPoint) {
+    nonlinear_solver = std::make_unique<mfem_ext::PetscNewtonSolver>(comm, nonlinear_opts);
+  } else if (nonlinear_opts.nonlin_solver == NonlinearSolver::PetscTrustRegion) {
+    nonlinear_solver = std::make_unique<mfem_ext::PetscNewtonSolver>(comm, nonlinear_opts);
+#endif
   }
   // KINSOL
   else {
@@ -792,7 +855,7 @@ std::unique_ptr<mfem::NewtonSolver> buildNonlinearSolver(const NonlinearSolverOp
 std::pair<std::unique_ptr<mfem::Solver>, std::unique_ptr<mfem::Solver>> buildLinearSolverAndPreconditioner(
     LinearSolverOptions linear_opts, MPI_Comm comm)
 {
-  auto preconditioner = buildPreconditioner(linear_opts.preconditioner, linear_opts.preconditioner_print_level, comm);
+  auto preconditioner = buildPreconditioner(linear_opts, comm);
 
   if (linear_opts.linear_solver == LinearSolver::SuperLU) {
     auto lin_solver = std::make_unique<SuperLUSolver>(linear_opts.print_level, comm);
@@ -817,6 +880,20 @@ std::pair<std::unique_ptr<mfem::Solver>, std::unique_ptr<mfem::Solver>> buildLin
     case LinearSolver::GMRES:
       iter_lin_solver = std::make_unique<mfem::GMRESSolver>(comm);
       break;
+#ifdef SERAC_USE_PETSC
+    case LinearSolver::PetscCG:
+      iter_lin_solver = std::make_unique<serac::mfem_ext::PetscKSPSolver>(comm, KSPCG, std::string());
+      break;
+    case LinearSolver::PetscGMRES:
+      iter_lin_solver = std::make_unique<serac::mfem_ext::PetscKSPSolver>(comm, KSPGMRES, std::string());
+      break;
+#else
+    case LinearSolver::PetscCG:
+    case LinearSolver::PetscGMRES:
+      SLIC_ERROR_ROOT("PETSc linear solver requested for non-PETSc build.");
+      exitGracefully(true);
+      break;
+#endif
     default:
       SLIC_ERROR_ROOT("Linear solver type not recognized.");
       exitGracefully(true);
@@ -889,10 +966,11 @@ std::unique_ptr<mfem::AmgXSolver> buildAMGX(const AMGXOptions& options, const MP
 }
 #endif
 
-std::unique_ptr<mfem::Solver> buildPreconditioner(Preconditioner preconditioner, int print_level,
-                                                  [[maybe_unused]] MPI_Comm comm)
+std::unique_ptr<mfem::Solver> buildPreconditioner(LinearSolverOptions linear_opts, [[maybe_unused]] MPI_Comm comm)
 {
   std::unique_ptr<mfem::Solver> preconditioner_solver;
+  auto                          preconditioner = linear_opts.preconditioner;
+  auto                          print_level    = linear_opts.print_level;
 
   // Handle the preconditioner - currently just BoomerAMG and HypreSmoother are supported
   if (preconditioner == Preconditioner::HypreAMG) {
@@ -918,9 +996,15 @@ std::unique_ptr<mfem::Solver> buildPreconditioner(Preconditioner preconditioner,
     preconditioner_solver = std::move(ilu_preconditioner);
   } else if (preconditioner == Preconditioner::AMGX) {
 #ifdef MFEM_USE_AMGX
-    preconditioner_solver = buildAMGX(AMGXOptions{}, comm);
+    preconditioner_solver = buildAMGX(linear_opts.amgx_options, comm);
 #else
     SLIC_ERROR_ROOT("AMGX requested in non-GPU build");
+#endif
+  } else if (preconditioner == Preconditioner::Petsc) {
+#ifdef SERAC_USE_PETSC
+    preconditioner_solver = mfem_ext::buildPetscPreconditioner(linear_opts.petsc_preconditioner, comm);
+#else
+    SLIC_ERROR_ROOT("PETSc preconditioner requested in non-PETSc build");
 #endif
   } else {
     SLIC_ERROR_ROOT_IF(preconditioner != Preconditioner::None, "Unknown preconditioner type requested");
@@ -952,8 +1036,9 @@ void EquationSolver::defineInputFileSchema(axom::inlet::Container& container)
   iterative_container.addInt("max_iter", "Maximum iterations for the linear solve.").defaultValue(5000);
   iterative_container.addInt("print_level", "Linear print level.").defaultValue(0);
   iterative_container.addString("solver_type", "Solver type (gmres|minres|cg).").defaultValue("gmres");
-  iterative_container.addString("prec_type", "Preconditioner type (JacobiSmoother|L1JacobiSmoother|AMG|ILU).")
+  iterative_container.addString("prec_type", "Preconditioner type (JacobiSmoother|L1JacobiSmoother|AMG|ILU|Petsc).")
       .defaultValue("JacobiSmoother");
+  iterative_container.addString("petsc_prec_type", "Type of PETSc preconditioner to use.").defaultValue("jacobi");
 
   auto& direct_container = linear_container.addStruct("direct_options", "Direct solver parameters");
   direct_container.addInt("print_level", "Linear print level.").defaultValue(0);
@@ -1013,6 +1098,12 @@ serac::LinearSolverOptions FromInlet<serac::LinearSolverOptions>::operator()(con
 #endif
   } else if (prec_type == "GaussSeidel") {
     options.preconditioner = serac::Preconditioner::HypreGaussSeidel;
+#ifdef SERAC_USE_PETSC
+  } else if (prec_type == "Petsc") {
+    const std::string petsc_prec = config["petsc_prec_type"];
+    options.preconditioner       = serac::Preconditioner::Petsc;
+    options.petsc_preconditioner = serac::mfem_ext::stringToPetscPCType(petsc_prec);
+#endif
   } else {
     std::string msg = axom::fmt::format("Unknown preconditioner type given: '{0}'", prec_type);
     SLIC_ERROR_ROOT(msg);
