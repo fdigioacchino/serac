@@ -190,6 +190,7 @@ public:
         geom_nonlin_(geom_nonlin),
         use_warm_start_(use_warm_start)
   {
+    SERAC_MARK_FUNCTION;
     SLIC_ERROR_ROOT_IF(mesh_.Dimension() != dim,
                        axom::fmt::format("Compile time dimension, {0}, and runtime mesh dimension, {1}, mismatch", dim,
                                          mesh_.Dimension()));
@@ -474,6 +475,27 @@ public:
    * @note This method must be called prior to completeSetup()
    */
   void setDisplacementBCs(const std::set<int>& disp_bdr, std::function<double(const mfem::Vector& x)> disp,
+                          int component)
+  {
+    // Project the coefficient onto the grid function
+    component_disp_bdr_coef_ = std::make_shared<mfem::FunctionCoefficient>(disp);
+
+    bcs_.addEssential(disp_bdr, component_disp_bdr_coef_, displacement_.space(), component);
+  }
+
+  /**
+   * @brief Set time-dependent displacement essential boundary conditions on a single component
+   *
+   * @param[in] disp_bdr The set of boundary attributes to set the displacement on
+   * @param[in] disp The vector function containing the set displacement values
+   * @param[in] component The component to set the displacment on
+   *
+   * u_i = disp(x, t), where x is the is the input position and t is the time. u_i is the value of
+   * the component of the applied displacement.
+   *
+   * @note This method must be called prior to completeSetup()
+   */
+  void setDisplacementBCs(const std::set<int>& disp_bdr, std::function<double(const mfem::Vector& x, double t)> disp,
                           int component)
   {
     // Project the coefficient onto the grid function
@@ -1117,6 +1139,7 @@ public:
 
         // residual function
         [this](const mfem::Vector& u, mfem::Vector& r) {
+          SERAC_MARK_FUNCTION;
           const mfem::Vector res =
               (*residual_)(time_, shape_displacement_, u, acceleration_, *parameters_[parameter_indices].state...);
 
@@ -1129,6 +1152,7 @@ public:
 
         // gradient of residual function
         [this](const mfem::Vector& u) -> mfem::Operator& {
+          SERAC_MARK_FUNCTION;
           auto [r, drdu] = (*residual_)(time_, shape_displacement_, differentiate_wrt(u), acceleration_,
                                         *parameters_[parameter_indices].state...);
           J_             = assemble(drdu);
@@ -1239,6 +1263,7 @@ public:
   /// @overload
   void advanceTimestep(double dt) override
   {
+    SERAC_MARK_FUNCTION;
     SLIC_ERROR_ROOT_IF(!residual_, "completeSetup() must be called prior to advanceTimestep(dt) in SolidMechanics.");
 
     // If this is the first call, initialize the previous parameter values as the initial values
@@ -1722,6 +1747,8 @@ protected:
    */
   void warmStartDisplacement(double dt)
   {
+    SERAC_MARK_FUNCTION;
+
     du_ = 0.0;
     for (auto& bc : bcs_.essentials()) {
       // apply the future boundary conditions, but use the most recent Jacobians stiffness.
